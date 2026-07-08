@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     io,
-    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
     time::Duration,
 };
@@ -9,23 +10,31 @@ use bytemuck::{Pod, Zeroable};
 use log::{debug, trace, warn};
 use netwatcher::WatchHandle;
 use parking_lot::Mutex;
+use socket2::SockRef;
 use tokio::{
     net::UdpSocket,
     time::{Interval, interval},
 };
 use zenoh::config::ZenohId;
 
-const GROUP: Ipv6Addr = Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0xe0a1, 0xde89);
+// IPv4 "Local Scope" administratively-scoped multicast address (RFC 2365, 239.255.0.0/16).
+// Chosen so exo doesn't collide with well-known multicast users (SSDP, mDNS, etc).
+const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 222, 137);
 const MAGIC: [u8; 3] = *b"EXO";
 
 pub struct Discovery {
     sock: Arc<UdpSocket>,
-    ifaces: Arc<Mutex<Vec<SocketAddrV6>>>,
+    /// interface index -> local ipv4 address(es) on that interface we've joined the
+    /// multicast group with. Also used to pick the outgoing interface (IP_MULTICAST_IF)
+    /// when announcing, since (unlike ipv6) an ipv4 destination address carries no scope.
+    ifaces: Arc<Mutex<HashMap<u32, Vec<Ipv4Addr>>>>,
     namespace: [u8; 8],
     last_nonce: Mutex<[u8; 8]>,
     /// the port of the service we are doing discovery for - transmitted to peers
     listen_port: u16,
     zid: ZenohId,
+    /// fixed multicast destination (GROUP:discovery_port) we announce to
+    dest: SocketAddrV4,
     tick: Interval,
     _sync: Mutex<WatchHandle>,
 }
@@ -33,7 +42,7 @@ pub struct Discovery {
 #[derive(Debug, Clone, Copy)]
 pub struct Discovered {
     pub zid: ZenohId,
-    pub addr: SocketAddrV6,
+    pub addr: SocketAddrV4,
 }
 
 impl Discovery {
@@ -44,59 +53,63 @@ impl Discovery {
         discovery_port: u16,
     ) -> io::Result<Self> {
         let sock = socket2::Socket::new(
-            socket2::Domain::IPV6,
+            socket2::Domain::IPV4,
             socket2::Type::DGRAM,
             Some(socket2::Protocol::UDP),
         )?;
         sock.set_reuse_address(true)?;
         #[cfg(unix)]
         sock.set_reuse_port(true)?;
-        sock.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, discovery_port, 0, 0).into())?;
+        sock.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, discovery_port).into())?;
         sock.set_nonblocking(true)?;
-        sock.set_multicast_loop_v6(true)?;
+        sock.set_multicast_loop_v4(true)?;
         let sock = Arc::new(UdpSocket::from_std(sock.into())?);
-        let ifaces: Arc<Mutex<Vec<SocketAddrV6>>> = Default::default();
+        let ifaces: Arc<Mutex<HashMap<u32, Vec<Ipv4Addr>>>> = Default::default();
         let _sync = Mutex::new(
             netwatcher::watch_interfaces_with_callback({
                 let sock = sock.clone();
                 let ifaces = ifaces.clone();
                 move |update| {
                     for (iface_idx, iface) in update.interfaces.iter() {
-                        if iface
-                            .ipv6_ips()
-                            .all(|addr| addr.is_loopback() || addr.is_unspecified())
-                        {
+                        let addrs: Vec<Ipv4Addr> = iface
+                            .ipv4_ips()
+                            .filter(|addr| !addr.is_loopback() && !addr.is_unspecified())
+                            .copied()
+                            .collect();
+                        if addrs.is_empty() {
                             continue;
                         }
 
-                        match sock.join_multicast_v6(&GROUP, *iface_idx) {
-                            Ok(()) => ifaces.lock().push(SocketAddrV6::new(
-                                GROUP,
-                                discovery_port,
-                                0,
-                                *iface_idx,
-                            )),
-                            Err(e) if e.kind() != io::ErrorKind::AddrInUse => {
-                                // skip AddrInUse - just means we've already joined the mv6
-                                if let Some(iface) = update.interfaces.get(&iface_idx) {
+                        let mut joined = Vec::new();
+                        for addr in addrs {
+                            match sock.join_multicast_v4(GROUP, addr) {
+                                Ok(()) => joined.push(addr),
+                                Err(e) if e.kind() != io::ErrorKind::AddrInUse => {
+                                    // skip AddrInUse - just means we've already joined the mv4
                                     warn!(
-                                        "failed to join multicast v6 for interface {}: {e}",
+                                        "failed to join multicast v4 for interface {} ({addr}): {e}",
                                         iface.name
                                     )
                                 }
+                                _ => {}
                             }
-                            _ => {}
+                        }
+                        if !joined.is_empty() {
+                            ifaces.lock().insert(*iface_idx, joined);
                         }
                     }
                     for iface_idx in update.diff.removed {
-                        ifaces.lock().retain(|addr| addr.scope_id() != iface_idx);
-
-                        if let Err(e) = sock.leave_multicast_v6(&GROUP, iface_idx) {
-                            if let Some(iface) = update.interfaces.get(&iface_idx) {
-                                warn!(
-                                    "failed to leave multicast v6 for interface {}: {e}",
-                                    iface.name
-                                )
+                        let Some(addrs) = ifaces.lock().remove(&iface_idx) else {
+                            continue;
+                        };
+                        for addr in addrs {
+                            if let Err(e) = sock.leave_multicast_v4(GROUP, addr) {
+                                if let Some(iface) = update.interfaces.get(&iface_idx) {
+                                    warn!(
+                                        "failed to leave multicast v4 for interface {} ({addr}): {e}",
+                                        iface.name
+                                    )
+                                }
                             }
                         }
                     }
@@ -112,6 +125,7 @@ impl Discovery {
             last_nonce: Mutex::new(rand::random()),
             listen_port,
             zid,
+            dest: SocketAddrV4::new(GROUP, discovery_port),
             tick: interval(Duration::from_secs(1)),
             _sync,
         })
@@ -213,8 +227,8 @@ impl Discovery {
                     trace!("dropped: stale nonce");
                     return Ok(None);
                 }
-                let SocketAddr::V6(v6) = addr else {
-                    trace!("dropped: v4 addr used");
+                let SocketAddr::V4(v4) = addr else {
+                    trace!("dropped: v6 addr used");
                     return Ok(None);
                 };
                 let Ok(zid) = ZenohId::try_from(&whats_up.zid[..]) else {
@@ -229,7 +243,7 @@ impl Discovery {
                 // the incoming port is our listen port;
                 // overwrite it with the whats_up port corresponding to the remote zenoh service
                 let addr = {
-                    let mut x = v6;
+                    let mut x = v4;
                     x.set_port(u16::from_le_bytes(whats_up.port_le));
                     x
                 };
@@ -247,17 +261,28 @@ impl Discovery {
         }
         .alloc();
 
-        let addrs = self.ifaces.lock().clone();
-        debug!("announcing Hello({nonce:?}) to {addrs:?}");
-        // rev so .remove() doesn't break things
-        for (i, addr) in addrs.into_iter().enumerate().rev() {
-            match self.sock.send_to(&buf, addr).await {
-                Ok(bytes) => trace!("sent {bytes} to {addr}"),
+        let ifaces = self.ifaces.lock().clone();
+        debug!("announcing Hello({nonce:?}) to {} interface(s)", ifaces.len());
+        for (iface_idx, addrs) in ifaces {
+            // ipv4 multicast sends have no per-destination scope (unlike ipv6), so the
+            // outgoing interface is instead selected on the socket itself via IP_MULTICAST_IF,
+            // using one of the local addresses we successfully joined the group with on it.
+            let Some(&local_addr) = addrs.first() else {
+                continue;
+            };
+            if let Err(e) = SockRef::from(&*self.sock).set_multicast_if_v4(&local_addr) {
+                debug!(
+                    "failed to set outgoing multicast interface to {local_addr} (idx {iface_idx}): {e}"
+                );
+                continue;
+            }
+            match self.sock.send_to(&buf, self.dest).await {
+                Ok(bytes) => trace!("sent {bytes} to {} via {local_addr}", self.dest),
                 Err(e) if e.kind() == io::ErrorKind::HostUnreachable => {
-                    debug!("disabling discovery address {addr}: {e}");
-                    _ = self.ifaces.lock().swap_remove(i);
+                    debug!("disabling discovery interface {iface_idx} ({local_addr}): {e}");
+                    self.ifaces.lock().remove(&iface_idx);
                 }
-                Err(e) => debug!("failed to reach {addr}: {e}"),
+                Err(e) => debug!("failed to reach {} via {local_addr}: {e}", self.dest),
             }
         }
         Ok(())

@@ -28,7 +28,7 @@ pub fn cfg(identity: &str, listen_port: u16) -> Result<zenoh::Config> {
     // todo: cleanup
     cfg.insert_json5("id", &format!("\"{identity}\""))?;
     cfg.insert_json5("mode", "\"router\"")?;
-    cfg.insert_json5("listen/endpoints", &format!("[\"tcp/[::]:{listen_port}\"]"))?;
+    cfg.insert_json5("listen/endpoints", &format!("[\"tcp/0.0.0.0:{listen_port}\"]"))?;
     cfg.insert_json5("scouting/multicast/enabled", "false")?;
     cfg.insert_json5("scouting/multicast/autoconnect", "[]")?;
     cfg.insert_json5("scouting/gossip/multihop", "true")?;
